@@ -1,9 +1,29 @@
-
 import os
+import pandas as pd
+import pyarrow
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+from typing import Dict
 from ._base_metric import _BaseMetric
 from .. import _timing
+
+MAX_PARQUET_ROW_COUNT = 5000
+FPA_C_SCHEMA: pyarrow.Schema = pyarrow.schema(
+    [
+        ("timestamp", pyarrow.int64()),
+        ("alpha", pyarrow.float64()),
+        ("tracker_id", pyarrow.int64()),
+    ]
+)
+MATCHES_COUNTS_SCHEMA: pyarrow.Schema = pyarrow.schema(
+    [
+        ("timestamp", pyarrow.int64()),
+        ("alpha", pyarrow.float64()),
+        ("gt_id", pyarrow.int64()),
+        ("tracker_id", pyarrow.int64()),
+        ("fpa_c_count", pyarrow.int64()),
+    ]
+)
 
 
 class HOTA(_BaseMetric):
@@ -49,6 +69,8 @@ class HOTA(_BaseMetric):
         gt_id_count = np.zeros((data['num_gt_ids'], 1))
         tracker_id_count = np.zeros((1, data['num_tracker_ids']))
 
+        fpa_c_file_number = 0
+        matches_counts_file_number = 0
         # First loop through each timestep and accumulate global track information.
         for t, (gt_ids_t, tracker_ids_t) in enumerate(zip(data['gt_ids'], data['tracker_ids'])):
             # Count the potential matches between ids in each timestep
@@ -68,6 +90,11 @@ class HOTA(_BaseMetric):
         global_alignment_score = potential_matches_count / (gt_id_count + tracker_id_count - potential_matches_count)
         matches_counts = [np.zeros_like(potential_matches_count) for _ in self.array_labels]
 
+        # Note: While environment variables are less than ideal, the work to properly plumb in parameters is non-trivial
+        fpa_c_folder = os.environ.get("FPA_C_FOLDER")
+        fpa_c_data = {"timestamp": [], "alpha": [], "tracker_id": []}
+        matches_counts_folder = os.environ.get("MATCHES_COUNTS_FOLDER")
+        matches_counts_data = {"timestamp": [], "alpha": [], "gt_id": [], "tracker_id": [], "fpa_c_count": []}
         # Calculate scores for each timestep
         for t, (gt_ids_t, tracker_ids_t) in enumerate(zip(data['gt_ids'], data['tracker_ids'])):
             # Deal with the case that there are no gt_det/tracker_det in a timestep.
@@ -92,6 +119,16 @@ class HOTA(_BaseMetric):
                 actually_matched_mask = similarity[match_rows, match_cols] >= alpha - np.finfo('float').eps
                 alpha_match_rows = match_rows[actually_matched_mask]
                 alpha_match_cols = match_cols[actually_matched_mask]
+                if fpa_c_folder is not None:
+                    for index, match in enumerate(actually_matched_mask):
+                        if not match:
+                            fpa_c_data["timestamp"].append(t)
+                            fpa_c_data["alpha"].append(alpha)
+                            fpa_c_data["tracker_id"].append(tracker_ids_t[index])
+                            if len(fpa_c_data["timestamp"]) >= MAX_PARQUET_ROW_COUNT:
+                                write_fpa_c_parquet(fpa_c_data, fpa_c_folder, fpa_c_file_number)
+                                fpa_c_file_number += 1
+
                 num_matches = len(alpha_match_rows)
                 res['HOTA_TP'][a] += num_matches
                 res['HOTA_FN'][a] += len(gt_ids_t) - num_matches
@@ -99,6 +136,25 @@ class HOTA(_BaseMetric):
                 if num_matches > 0:
                     res['LocA'][a] += sum(similarity[alpha_match_rows, alpha_match_cols])
                     matches_counts[a][gt_ids_t[alpha_match_rows], tracker_ids_t[alpha_match_cols]] += 1
+
+            # Write matches_counts row
+            if matches_counts_folder is not None:
+                for a, alpha in enumerate(self.array_labels):
+                    matches_count = matches_counts[a]
+                    for row_index, row in enumerate(matches_count):
+                        for column_index, count in enumerate(row):
+                            matches_counts_data["timestamp"].append(t)
+                            matches_counts_data["alpha"].append(alpha)
+                            matches_counts_data["gt_id"].append(gt_ids_t[row_index])
+                            matches_counts_data["tracker_id"].append(tracker_ids_t[column_index])
+                            matches_counts_data["fpa_c_count"].append(count)
+                            if len(matches_counts_data["timestamp"]) >= MAX_PARQUET_ROW_COUNT:
+                                write_matches_counts_parquet(matches_counts_data, matches_counts_folder, matches_counts_file_number)
+                                matches_counts_file_number += 1
+        if len(fpa_c_data["timestamp"]) > 0:
+            write_fpa_c_parquet(fpa_c_data, fpa_c_folder, fpa_c_file_number)
+        if len(matches_counts_data["timestamp"]) > 0:
+            write_matches_counts_parquet(matches_counts_data, matches_counts_folder, matches_counts_file_number)
 
         # Calculate association scores (AssA, AssRe, AssPr) for the alpha value.
         # First calculate scores per gt_id/tracker_id combo and then average over the number of detections.
@@ -201,3 +257,25 @@ class HOTA(_BaseMetric):
         plt.savefig(out_file)
         plt.savefig(out_file.replace('.pdf', '.png'))
         plt.clf()
+
+
+def write_fpa_c_parquet(fpa_c_data: Dict, fpa_c_folder: str, fpa_c_file_number: int) -> None:
+    parquet_file_name = f"part-{fpa_c_file_number:020}.snappy.parquet"
+    parquet_full_path = os.path.join(fpa_c_folder, parquet_file_name)
+    dataframe = pd.DataFrame(fpa_c_data)
+    dataframe.to_parquet(parquet_full_path, compression="snappy", schema=FPA_C_SCHEMA)
+    fpa_c_data["timestamp"].clear()
+    fpa_c_data["alpha"].clear()
+    fpa_c_data["tracker_id"].clear()
+
+
+def write_matches_counts_parquet(matches_counts_data: Dict, fpa_c_folder: str, matches_counts_file_number: int) -> None:
+    dataframe = pd.DataFrame(matches_counts_data)
+    parquet_file_name = f"part-{matches_counts_file_number:020}.snappy.parquet"
+    parquet_full_path = os.path.join(fpa_c_folder, parquet_file_name)
+    dataframe.to_parquet(parquet_full_path, compression="snappy", schema=MATCHES_COUNTS_SCHEMA)
+    matches_counts_data["timestamp"].clear()
+    matches_counts_data["alpha"].clear()
+    matches_counts_data["gt_id"].clear()
+    matches_counts_data["tracker_id"].clear()
+    matches_counts_data["fpa_c_count"].clear()
