@@ -17,6 +17,14 @@ MATCHES_COUNTS_SCHEMA: pyarrow.Schema = pyarrow.schema(
     ]
 )
 
+FNA_COUNTS_SCHEMA: pyarrow.Schema = pyarrow.schema(
+    [
+        ("alpha", pyarrow.float64()),
+        ("gt_id", pyarrow.int64()),
+        ("fna_count", pyarrow.int64()),
+    ]
+)
+
 
 class HOTA(_BaseMetric):
     """Class which implements the HOTA metrics.
@@ -61,7 +69,6 @@ class HOTA(_BaseMetric):
         gt_id_count = np.zeros((data['num_gt_ids'], 1))
         tracker_id_count = np.zeros((1, data['num_tracker_ids']))
 
-        matches_counts_file_number = 0
         # First loop through each timestep and accumulate global track information.
         for t, (gt_ids_t, tracker_ids_t) in enumerate(zip(data['gt_ids'], data['tracker_ids'])):
             # Count the potential matches between ids in each timestep
@@ -80,10 +87,15 @@ class HOTA(_BaseMetric):
         # Calculate overall jaccard alignment score (before unique matching) between IDs
         global_alignment_score = potential_matches_count / (gt_id_count + tracker_id_count - potential_matches_count)
         matches_counts = [np.zeros_like(potential_matches_count) for _ in self.array_labels]
+        fna_counts = [np.zeros(data['num_gt_ids']) for _ in self.array_labels]
 
         # Note: While environment variables are less than ideal, the work to properly plumb in parameters is non-trivial
         matches_counts_folder = os.environ.get("MATCHES_COUNTS_FOLDER")
         matches_counts_data = {"alpha": [], "gt_id": [], "track_id": [], "match_count": []}
+        matches_counts_file_number = 0
+        fna_counts_folder = os.environ.get("FNA_COUNTS_FOLDER")
+        fna_counts_data = {"alpha": [], "gt_id": [], "fna_count": []}
+        fna_counts_file_number = 0
         # Calculate scores for each timestep
         for t, (gt_ids_t, tracker_ids_t) in enumerate(zip(data['gt_ids'], data['tracker_ids'])):
             # Deal with the case that there are no gt_det/tracker_det in a timestep.
@@ -107,6 +119,9 @@ class HOTA(_BaseMetric):
             for a, alpha in enumerate(self.array_labels):
                 actually_matched_mask = similarity[match_rows, match_cols] >= alpha - np.finfo('float').eps
                 alpha_match_rows = match_rows[actually_matched_mask]
+                if fna_counts_folder is not None:
+                    alpha_non_match_rows = np.setdiff1d(gt_ids_t, alpha_match_rows)
+                    fna_counts[a][alpha_non_match_rows] += 1
                 alpha_match_cols = match_cols[actually_matched_mask]
                 num_matches = len(alpha_match_rows)
                 res['HOTA_TP'][a] += num_matches
@@ -128,8 +143,21 @@ class HOTA(_BaseMetric):
                     if len(matches_counts_data["gt_id"]) >= MAX_PARQUET_ROW_COUNT:
                         write_matches_counts_parquet(matches_counts_data, matches_counts_folder, matches_counts_file_number)
                         matches_counts_file_number += 1
+        if fna_counts_folder is not None:
+            for a, alpha in enumerate(self.array_labels):
+                fna_count = fna_counts[a]
+                gt_id_indices = np.arange(len(fna_count))
+                fna_gt_ids = gt_id_indices[fna_count > 0]
+                fna_counts_data["alpha"].extend([alpha] * len(fna_gt_ids))
+                fna_counts_data["gt_id"].extend(range(len(fna_gt_ids)))
+                fna_counts_data["fna_count"].extend(fna_gt_ids)
+                if len(fna_counts_data["gt_id"]) >= MAX_PARQUET_ROW_COUNT:
+                    write_fna_counts_parquet(fna_counts_data, fna_counts_folder, fna_counts_file_number)
+
         if len(matches_counts_data["gt_id"]) > 0:
             write_matches_counts_parquet(matches_counts_data, matches_counts_folder, matches_counts_file_number)
+        if len(fna_counts_data["gt_id"]) > 0:
+            write_fna_counts_parquet(fna_counts_data, fna_counts_folder, fna_counts_file_number)
 
         # Calculate association scores (AssA, AssRe, AssPr) for the alpha value.
         # First calculate scores per gt_id/tracker_id combo and then average over the number of detections.
@@ -243,3 +271,13 @@ def write_matches_counts_parquet(matches_counts_data: Dict, matches_counts_folde
     matches_counts_data["gt_id"].clear()
     matches_counts_data["track_id"].clear()
     matches_counts_data["match_count"].clear()
+
+
+def write_fna_counts_parquet(matches_counts_data: Dict, matches_counts_folder: str, matches_counts_file_number: int) -> None:
+    dataframe = pd.DataFrame(matches_counts_data)
+    parquet_file_name = f"part-{matches_counts_file_number:020}.snappy.parquet"
+    parquet_full_path = os.path.join(matches_counts_folder, parquet_file_name)
+    dataframe.to_parquet(parquet_full_path, compression="snappy", schema=FNA_COUNTS_SCHEMA)
+    matches_counts_data["alpha"].clear()
+    matches_counts_data["gt_id"].clear()
+    matches_counts_data["fna_count"].clear()
